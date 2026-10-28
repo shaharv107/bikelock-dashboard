@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BikeLock Sentinel - IoT Dashboard</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Leaflet CSS & JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    @keyframes pulse-ring {
+      0% { transform: scale(0.95); opacity: 0.8; }
+      50% { transform: scale(1.4); opacity: 0.2; }
+      100% { transform: scale(0.95); opacity: 0.8; }
+    }
+    .pulse-ring-anim {
+      animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    @keyframes emergency-flash {
+      0%, 100% { background-color: rgba(220, 38, 38, 0.25); border-color: rgba(239, 68, 68, 0.8); }
+      50% { background-color: rgba(185, 28, 28, 0.6); border-color: rgba(248, 113, 113, 1); }
+    }
+    .emergency-alarm {
+      animation: emergency-flash 1s infinite alternate;
+    }
+    #map {
+      height: 100%;
+      min-height: 440px;
+      border-radius: 0.75rem;
+      z-index: 10;
+    }
+    .dark-map .leaflet-tile {
+      filter: brightness(0.65) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.75);
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans min-h-screen flex flex-col">
+
+  <!-- Top Emergency Alert Bar (Theft) -->
+  <div id="emergencyBar" class="hidden emergency-alarm border-b-2 border-red-600 px-4 py-3 text-red-100 flex items-center justify-between shadow-2xl z-50">
+    <div class="flex items-center gap-3">
+      <div class="p-2 bg-red-600 rounded-full animate-bounce">
+        <i data-lucide="shield-alert" class="w-6 h-6 text-white"></i>
+      </div>
+      <div>
+        <p class="font-black text-lg tracking-wide text-white">התראת גניבה קריטית: זוהה חיתוך דיסק ללא נוכחות בעלים!</p>
+        <p class="text-xs text-red-200" id="emergencyStatusText">הבקר התעורר מ-Deep Sleep • שרת Render מזניק שיחת חירום ב-Twilio</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <button onclick="silenceSiren()" id="muteBtn" class="px-3 py-1.5 bg-red-800 hover:bg-red-700 text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 transition">
+        <i data-lucide="volume-x" class="w-4 h-4"></i>
+        השתק צופר
+      </button>
+      <button onclick="dismissAlarm()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 transition">
+        <i data-lucide="check" class="w-4 h-4"></i>
+        אני ליד האופניים (בטל אזעקה)
+      </button>
+    </div>
+  </div>
+
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur px-6 py-4 flex flex-wrap justify-between items-center gap-4">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
+        <i data-lucide="lock" class="w-5 h-5"></i>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="text-lg font-bold text-slate-100">BikeLock Sentinel</h1>
+          <span class="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Render Connected</span>
+        </div>
+        <p class="text-xs text-slate-400">דשבורד אבטחה אישי למניעת גניבות • מחובר לענן בשידור חי</p>
+      </div>
+    </div>
+
+    <!-- Quick Status Pill -->
+    <div class="flex items-center gap-3 flex-wrap">
+      <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700">
+        <span id="controllerStateDot" class="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></span>
+        <span id="controllerStateText" class="text-xs font-semibold text-slate-200">DEEP SLEEP</span>
+      </div>
+
+      <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700">
+        <i data-lucide="battery" class="w-4 h-4 text-emerald-400"></i>
+        <span id="batteryDisplay" class="text-xs font-semibold text-slate-200">96%</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content Grid -->
+  <main class="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-7xl mx-auto w-full">
+    
+    <!-- Left Column: Map (8 Cols) -->
+    <div class="lg:col-span-8 flex flex-col gap-4">
+      <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 flex flex-col flex-1 shadow-lg">
+        <div class="flex justify-between items-center mb-3">
+          <div class="flex items-center gap-2">
+            <i data-lucide="map-pin" class="w-5 h-5 text-indigo-400"></i>
+            <h2 class="text-sm font-bold text-slate-200">מיקום GPS נוכחי והיסטוריית תנועה</h2>
+          </div>
+          <div class="flex items-center gap-2">
+            <span id="gpsFixBadge" class="text-[11px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 font-mono">
+              GPS Standby
+            </span>
+            <button onclick="centerMap()" class="p-1.5 hover:bg-slate-800 rounded-md text-slate-400 hover:text-slate-200 transition" title="מרכז מפה">
+              <i data-lucide="crosshair" class="w-4 h-4"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- Map Container -->
+        <div class="flex-1 w-full rounded-xl overflow-hidden relative border border-slate-800/80">
+          <div id="map" class="dark-map"></div>
+          
+          <div class="absolute bottom-3 left-3 bg-slate-900/90 backdrop-blur border border-slate-700/80 p-2.5 rounded-xl z-[400] text-xs font-mono flex gap-4 text-slate-300 shadow-xl">
+            <div>
+              <span class="text-slate-500 block text-[10px]">קו אורך / רוחב</span>
+              <span id="coordsDisplay">32.0853, 34.7818</span>
+            </div>
+            <div>
+              <span class="text-slate-500 block text-[10px]">מהירות</span>
+              <span id="speedDisplay">0.0 קמ"ש</span>
+            </div>
+            <div>
+              <span class="text-slate-500 block text-[10px]">סנכרון אחרון מהשרת</span>
+              <span id="lastSeenDisplay" class="text-emerald-400">מתחבר...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: Keep-Alive & Controls (4 Cols) -->
+    <div class="lg:col-span-4 flex flex-col gap-4">
+
+      <!-- Keep-Alive Status Card -->
+      <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 shadow-lg">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="text-sm font-bold text-slate-200 flex items-center gap-2">
+            <i data-lucide="radio" class="w-4 h-4 text-emerald-400"></i>
+            ערוץ תקשורת ו-Keep-Alive
+          </h3>
+          <span id="channelBadge" class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-bold flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+            ערוץ פעיל
+          </span>
+        </div>
+
+        <div class="p-3 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2.5 text-xs">
+          <div class="flex justify-between items-center">
+            <span class="text-slate-400">התקשרות אחרונה:</span>
+            <span id="exactTimestamp" class="font-mono text-slate-200 font-semibold">--:--:--</span>
+          </div>
+
+          <div class="flex justify-between items-center">
+            <span class="text-slate-400">זמן שחלף:</span>
+            <span id="timeElapsedText" class="font-mono text-emerald-400 font-bold">מעדכן...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Cloud API Configuration -->
+      <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 shadow-lg">
+        <h3 class="text-sm font-bold text-slate-200 flex items-center gap-2 mb-2">
+          <i data-lucide="settings" class="w-4 h-4 text-indigo-400"></i>
+          הגדרות חיבור ל-Render
+        </h3>
+        <label class="block text-[11px] text-slate-400 mb-1">API Secret Key:</label>
+        <input type="password" id="apiKeyInput" value="bikelock_secret_2026" 
+               class="w-full px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500 mb-2">
+        <button onclick="saveApiKey()" class="w-full py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg transition">
+          עדכן מפתח אימות
+        </button>
+      </div>
+
+      <!-- Live Server Simulation / Control -->
+      <div class="bg-indigo-950/30 border border-indigo-900/50 rounded-2xl p-4 shadow-lg">
+        <h3 class="text-xs font-bold text-indigo-300 uppercase tracking-wider flex items-center gap-1.5 mb-2">
+          <i data-lucide="sliders" class="w-3.5 h-3.5"></i>
+          בדיקת שרת ישירה (Live API Calls)
+        </h3>
+        <p class="text-[11px] text-indigo-200/70 mb-3">שליחת פקודות ישירות לשרת ה-Render שלך:</p>
+
+        <div class="grid grid-cols-1 gap-2">
+          <button onclick="sendServerKeepAlive()" class="w-full py-2 px-3 bg-emerald-700/80 hover:bg-emerald-600 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition">
+            <i data-lucide="radio" class="w-4 h-4"></i>
+            שלח Keep-Alive לשרת (POST /api/keepalive)
+          </button>
+
+          <button onclick="sendServerAlarm()" class="w-full py-2 px-3 bg-red-600/90 hover:bg-red-500 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition shadow-lg">
+            <i data-lucide="flame" class="w-4 h-4"></i>
+            הפעל התראת פריצה בשרת (POST /api/alarm)
+          </button>
+        </div>
+      </div>
+
+    </div>
+
+  </main>
+
+  <script>
+    lucide.createIcons();
+
+    // Configuration
+    const BACKEND_URL = "https://bikelock-backend.onrender.com";
+    let apiKey = localStorage.getItem('bikelock_api_key') || "bikelock_secret_2026";
+    document.getElementById('apiKeyInput').value = apiKey;
+
+    function saveApiKey() {
+      apiKey = document.getElementById('apiKeyInput').value.trim();
+      localStorage.setItem('bikelock_api_key', apiKey);
+      alert('מפתח ה-API עודכן בהצלחה!');
+      fetchServerStatus();
+    }
+
+    // Map & Audio State
+    let map, bikeMarker, pathPolyline;
+    let currentCoords = [32.0853, 34.7818];
+    let pathHistory = [currentCoords];
+    let isAlarmActive = false;
+    let audioCtx = null;
+    let sirenOsc = null;
+    let isSirenMuted = false;
+
+    function initMap() {
+      map = L.map('map', {
+        zoomControl: false,
+        attributionControl: false
+      }).setView(currentCoords, 16);
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+      const bikeIcon = L.divIcon({
+        className: 'custom-bike-marker',
+        html: `
+          <div class="relative flex items-center justify-center w-8 h-8">
+            <div class="absolute w-8 h-8 bg-indigo-500 rounded-full opacity-40 pulse-ring-anim"></div>
+            <div class="relative w-5 h-5 bg-indigo-600 border-2 border-white rounded-full flex items-center justify-center shadow-lg">
+              <div class="w-2 h-2 bg-white rounded-full"></div>
+            </div>
+          </div>
+        `,
+        iconSize: [32, 32],
+        iconAnchor: [16, 16]
+      });
+
+      bikeMarker = L.marker(currentCoords, { icon: bikeIcon }).addTo(map);
+      pathPolyline = L.polyline(pathHistory, { color: '#6366f1', weight: 4, opacity: 0.8 }).addTo(map);
+    }
+
+    function centerMap() {
+      if (map) map.setView(currentCoords, 17, { animate: true });
+    }
+
+    // Audio Siren
+    function startAudioSiren() {
+      if (isSirenMuted) return;
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+
+        sirenOsc = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        sirenOsc.type = 'sawtooth';
+        
+        const now = audioCtx.currentTime;
+        sirenOsc.frequency.setValueAtTime(600, now);
+        sirenOsc.frequency.linearRampToValueAtTime(1200, now + 0.4);
+        sirenOsc.frequency.linearRampToValueAtTime(600, now + 0.8);
+        
+        gainNode.gain.setValueAtTime(0.2, now);
+        sirenOsc.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        sirenOsc.start();
+        
+        sirenOsc.onended = () => {
+          if (isAlarmActive && !isSirenMuted) startAudioSiren();
+        };
+        sirenOsc.stop(now + 0.8);
+      } catch (e) {}
+    }
+
+    function silenceSiren() {
+      isSirenMuted = true;
+      document.getElementById('muteBtn').classList.add('opacity-50');
+      document.getElementById('muteBtn').innerHTML = `<i data-lucide="volume-2" class="w-4 h-4"></i> צופר הושתק`;
+      lucide.createIcons();
+    }
+
+    // Real Server Communication
+    async function fetchServerStatus() {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/status`, {
+          headers: { 'x-api-key': apiKey }
+        });
+        if (!res.ok) throw new Error('Unauthorized or Server Error');
+        const json = await res.json();
+        updateUIFromData(json.data);
+      } catch (err) {
+        document.getElementById('lastSeenDisplay').innerText = 'שגיאת חיבור לשרת';
+      }
+    }
+
+    function updateUIFromData(data) {
+      // Coords & Map
+      if (data.lat && data.lng) {
+        const newCoords = [data.lat, data.lng];
+        if (newCoords[0] !== currentCoords[0] || newCoords[1] !== currentCoords[1]) {
+          currentCoords = newCoords;
+          pathHistory.push([...currentCoords]);
+          bikeMarker.setLatLng(currentCoords);
+          pathPolyline.setLatLngs(pathHistory);
+          map.panTo(currentCoords);
+        }
+        document.getElementById('coordsDisplay').innerText = `${data.lat.toFixed(4)}, ${data.lng.toFixed(4)}`;
+      }
+
+      document.getElementById('batteryDisplay').innerText = `${data.batteryPercent}%`;
+      document.getElementById('speedDisplay').innerText = `${data.speed.toFixed(1)} קמ"ש`;
+
+      // Timestamps
+      const lastPing = new Date(data.lastKeepAlive || data.lastSeen);
+      document.getElementById('exactTimestamp').innerText = lastPing.toLocaleTimeString('he-IL');
+      
+      const diffSec = Math.floor((new Date() - lastPing) / 1000);
+      const mins = Math.floor(diffSec / 60);
+      const secs = diffSec % 60;
+      document.getElementById('timeElapsedText').innerText = mins > 0 ? `לפני ${mins} דק' ו-${secs} שנ'` : `לפני ${secs} שנ'`;
+      document.getElementById('lastSeenDisplay').innerText = 'סונכרן עכשיו';
+
+      // Alarm State
+      if (data.isAlarm) {
+        if (!isAlarmActive) {
+          isAlarmActive = true;
+          isSirenMuted = false;
+          startAudioSiren();
+        }
+        document.getElementById('emergencyBar').classList.remove('hidden');
+        document.getElementById('controllerStateDot').className = 'w-2.5 h-2.5 rounded-full bg-red-500 animate-ping';
+        document.getElementById('controllerStateText').innerText = 'ALARM TRACKING ACTIVE';
+        document.getElementById('gpsFixBadge').innerText = 'GPS משדר חי מהשטח';
+      } else {
+        isAlarmActive = false;
+        document.getElementById('emergencyBar').classList.add('hidden');
+        document.getElementById('controllerStateDot').className = 'w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse';
+        document.getElementById('controllerStateText').innerText = data.deviceStatus;
+        document.getElementById('gpsFixBadge').innerText = 'GPS Standby';
+      }
+    }
+
+    async function sendServerKeepAlive() {
+      try {
+        await fetch(`${BACKEND_URL}/api/keepalive`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+          body: JSON.stringify({ battery: 96 })
+        });
+        fetchServerStatus();
+      } catch (e) {
+        alert('שגיאה בשליחת Keep-Alive לשרת');
+      }
+    }
+
+    async function sendServerAlarm() {
+      try {
+        await fetch(`${BACKEND_URL}/api/alarm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+          body: JSON.stringify({
+            event: 'DISC_CUT_DETECTED',
+            lat: currentCoords[0] + 0.0004,
+            lng: currentCoords[1] + 0.0003,
+            speed: 19.5,
+            battery: 95
+          })
+        });
+        fetchServerStatus();
+      } catch (e) {
+        alert('שגיאה בהזנקת אזעקה בשרת');
+      }
+    }
+
+    async function dismissAlarm() {
+      try {
+        await fetch(`${BACKEND_URL}/api/dismiss`, {
+          method: 'POST',
+          headers: { 'x-api-key': apiKey }
+        });
+        fetchServerStatus();
+      } catch (e) {
+        alert('שגיאה באיפוס האזעקה');
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      initMap();
+      fetchServerStatus();
+      setInterval(fetchServerStatus, 3000); // Poll server every 3s
+    });
+  </script>
+</body>
+</html>
